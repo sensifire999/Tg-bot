@@ -1,0 +1,739 @@
+"""
+bot.py — Remote Code Runner Telegram Bot
+=========================================
+All text output uses ParseMode.HTML exclusively.
+Every piece of user-supplied data is passed through html.escape() before
+being embedded in any message to prevent "Can't parse entities" errors.
+"""
+
+import html
+import logging
+import math
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+from typing import Optional
+
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,WebAppInfo
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+import database as db
+import security
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+BOT_TOKEN = "8746874676:AAHhMQThSPHCylr8Cbeo5pMlLP86gOS3ZYw"
+ADMIN_ID = 8084057668
+
+EXECUTION_TIMEOUT = 300       # seconds before process is killed
+CREDITS_PER_MINUTE = 1        # credit cost per 60-second block
+SANDBOX_BASE = tempfile.gettempdir()
+WELCOME_CREDITS = 5           # free credits given on first /start
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def esc(text: str) -> str:
+    """Shorthand for html.escape — ALWAYS use this on user-supplied strings."""
+    return html.escape(str(text))
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+def compute_credits(duration_sec: float) -> int:
+    """1 credit per 60-second block, minimum 1."""
+    return max(1, math.ceil(duration_sec / 60))
+
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👤 Profile",  callback_data="cb_profile"),
+            InlineKeyboardButton("🎟️ Redeem",   callback_data="cb_redeem"),
+        ],
+        [
+            InlineKeyboardButton("❓ Help",     callback_data="cb_help"),
+            InlineKeyboardButton("📊 My Stats", callback_data="cb_mystats"),
+        ],
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Guard decorators
+# ─────────────────────────────────────────────────────────────────────────────
+
+def registered(func):
+    """Upsert user in DB and reject blocked users before handler runs."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user is None:
+            return
+        db.upsert_user(user.id, user.username or "", user.full_name or "")
+        if db.is_blocked(user.id) and not is_admin(user.id):
+            await update.effective_message.reply_text(
+                "🚫 You have been <b>banned</b> from using this bot.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        return await func(update, context)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+def admin_only(func):
+    """Reject non-admins with a clean HTML error."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            await update.effective_message.reply_text(
+                "🚫 <b>Admin only command.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        return await func(update, context)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+    credits = user_data["credits"] if user_data else WELCOME_CREDITS
+
+    text = (
+        f"👋 Welcome, <b>{esc(user.full_name)}</b>!\n\n"
+        f"🤖 I'm a <b>Remote Code Runner</b> bot.\n"
+        f"Send me a <code>.py</code> file and I'll execute it securely.\n\n"
+        f"💳 <b>Your Credits:</b> <code>{credits}</code>\n"
+        f"📌 Each 60-second run block costs <b>1 credit</b>.\n\n"
+        f"Use the buttons below to navigate:"
+    )
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu(),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /profile
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = db.get_user(user.id)
+    if not data:
+        await update.message.reply_text("Please /start first.", parse_mode=ParseMode.HTML)
+        return
+
+    text = (
+        "👤 <b>Your Profile</b>\n"
+        "─────────────────────\n"
+        f"🆔 <b>User ID:</b> <code>{data['user_id']}</code>\n"
+        f"📛 <b>Name:</b> {esc(data['full_name'])}\n"
+        f"🔖 <b>Username:</b> @{esc(data['username']) if data['username'] else 'N/A'}\n"
+        f"💳 <b>Credits:</b> <code>{data['credits']}</code>\n"
+        f"▶️ <b>Total Runs:</b> <code>{data['total_runs']}</code>\n"
+        f"📅 <b>Joined:</b> <code>{data['joined_at']}</code>\n"
+        f"🚫 <b>Blocked:</b> {'Yes' if data['is_blocked'] else 'No'}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /credits
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    balance = db.get_credits(user.id)
+    await update.message.reply_text(
+        f"💳 <b>Credits Balance</b>\n\n"
+        f"You have <code>{balance}</code> credit(s).\n"
+        f"Each 60-second execution block costs <b>1 credit</b> (minimum 1).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /redeem <code>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def cmd_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/redeem &lt;CODE&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    code = context.args[0].upper().strip()
+    success, message, _ = db.redeem_code(user.id, code)
+    new_balance = db.get_credits(user.id)
+    await update.message.reply_text(
+        f"{message}\n\n💳 <b>New Balance:</b> <code>{new_balance}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /help
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 <b>Help &amp; Commands</b>\n"
+        "────────────────────────\n"
+        "▶️ <b>Send a .py file</b> to execute Python code\n"
+        "/start — Main menu\n"
+        "/profile — Your account details\n"
+        "/credits — Check credit balance\n"
+        "/redeem <code>&lt;CODE&gt;</code> — Redeem a credit code\n"
+        "/help — This help message\n\n"
+        "💡 <b>Execution Rules</b>\n"
+        "• Costs <b>1 credit per 60 s</b> (min 1)\n"
+        f"• Hard timeout: <b>{EXECUTION_TIMEOUT}s</b>\n"
+        "• Dangerous keywords are <b>blocked</b> for safety\n"
+        "• Each run uses an isolated sandbox folder"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline button callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="cb_back")]])
+
+    if data == "cb_profile":
+        if not user_data:
+            await query.edit_message_text("Please /start first.")
+            return
+        text = (
+            "👤 <b>Your Profile</b>\n"
+            "─────────────────────\n"
+            f"🆔 <b>ID:</b> <code>{user_data['user_id']}</code>\n"
+            f"📛 <b>Name:</b> {esc(user_data['full_name'])}\n"
+            f"🔖 <b>Username:</b> @{esc(user_data['username']) if user_data['username'] else 'N/A'}\n"
+            f"💳 <b>Credits:</b> <code>{user_data['credits']}</code>\n"
+            f"▶️ <b>Total Runs:</b> <code>{user_data['total_runs']}</code>\n"
+            f"📅 <b>Joined:</b> <code>{user_data['joined_at']}</code>"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_btn)
+
+    elif data == "cb_redeem":
+        await query.edit_message_text(
+            "🎟️ <b>Redeem a Code</b>\n\nUse the command:\n<code>/redeem YOUR_CODE_HERE</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_btn,
+        )
+
+    elif data == "cb_help":
+        text = (
+            "📖 <b>Help</b>\n"
+            "─────────────────────\n"
+            "• Send a <code>.py</code> file to run it\n"
+            "• <b>1 credit</b> per 60-second block (min 1)\n"
+            f"• Timeout: <b>{EXECUTION_TIMEOUT}s</b>\n"
+            "• Forbidden code is blocked automatically\n\n"
+            "<b>Commands:</b>\n"
+            "/profile  /credits  /redeem  /help"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_btn)
+
+    elif data == "cb_mystats":
+        if not user_data:
+            await query.edit_message_text("No data found.")
+            return
+        text = (
+            "📊 <b>My Stats</b>\n"
+            "─────────────────────\n"
+            f"💳 <b>Credits:</b> <code>{user_data['credits']}</code>\n"
+            f"▶️ <b>Total Runs:</b> <code>{user_data['total_runs']}</code>\n"
+            f"📅 <b>Member Since:</b> <code>{user_data['joined_at']}</code>"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_btn)
+
+    elif data == "cb_back":
+        credits = user_data["credits"] if user_data else 0
+        text = (
+            f"👋 Welcome back, <b>{esc(user.full_name)}</b>!\n\n"
+            f"💳 <b>Credits:</b> <code>{credits}</code>\n\n"
+            "Use the buttons below to navigate:"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=build_main_menu())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .py file execution handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def handle_python_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    document = update.message.document
+    filename = document.file_name or "script.py"
+
+    if not filename.lower().endswith(".py"):
+        await update.message.reply_text(
+            "⚠️ Please send a valid <code>.py</code> file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    balance = db.get_credits(user.id)
+    if balance < 1:
+        await update.message.reply_text(
+            "❌ <b>Insufficient Credits!</b>\n\n"
+            "You need at least <b>1 credit</b> to run code.\n"
+            "Use <code>/redeem &lt;CODE&gt;</code> to top up.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Create isolated sandbox
+    run_id = str(uuid.uuid4())
+    sandbox_dir = os.path.join(SANDBOX_BASE, f"coderunner_{run_id}")
+    os.makedirs(sandbox_dir, exist_ok=True)
+    script_path = os.path.join(sandbox_dir, f"script_{run_id}.py")
+
+    try:
+        tg_file = await document.get_file()
+        await tg_file.download_to_drive(script_path)
+    except Exception as exc:
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        await update.message.reply_text(
+            f"❌ Download failed: <code>{esc(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Security scan
+    try:
+        is_safe, violations = security.scan_file(script_path)
+    except Exception as exc:
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        await update.message.reply_text(
+            f"❌ Scan error: <code>{esc(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not is_safe:
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        lines = "\n".join(f"  • <code>{esc(v)}</code>" for v in violations[:10])
+        await update.message.reply_text(
+            f"🚫 <b>Security Scan Failed!</b>\n\nForbidden patterns:\n{lines}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        f"⏳ <b>Executing</b> <code>{esc(filename)}</code>...\n"
+        f"💳 Balance: <code>{balance}</code>  |  ⏱ Timeout: <code>{EXECUTION_TIMEOUT}s</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    db.add_active_session(user.id, filename, -1)
+    start_time = time.monotonic()
+    timed_out = False
+
+    try:
+        process = subprocess.Popen(
+            ["python3", script_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=sandbox_dir,
+            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": sandbox_dir},
+        )
+        db.add_active_session(user.id, filename, process.pid)
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(timeout=EXECUTION_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout_bytes, stderr_bytes = process.communicate()
+            timed_out = True
+        return_code = process.returncode
+    except Exception as exc:
+        db.remove_active_session(user.id)
+        shutil.rmtree(sandbox_dir, ignore_errors=True)
+        await status_msg.edit_text(
+            f"❌ <b>Runtime error:</b> <code>{esc(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    finally:
+        db.remove_active_session(user.id)
+
+    duration = time.monotonic() - start_time
+    credits_used = compute_credits(duration)
+
+    if not db.deduct_credits(user.id, credits_used):
+        db.deduct_credits(user.id, balance)  # deduct whatever is left
+        credits_used = balance
+
+    new_balance = db.get_credits(user.id)
+    db.log_execution(user.id, filename, credits_used, duration, return_code == 0)
+
+    MAX_OUT = 3000
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+    def section(text: str, label: str) -> str:
+        if not text:
+            return ""
+        if len(text) > MAX_OUT:
+            text = text[:MAX_OUT] + f"\n…[{len(text)} chars, truncated]"
+        return f"\n<b>{label}</b>\n<code>{esc(text)}</code>"
+
+    icon = "✅" if (return_code == 0 and not timed_out) else ("⏰" if timed_out else "❌")
+    label = "Success" if (return_code == 0 and not timed_out) else ("Timed Out" if timed_out else f"Error (exit {return_code})")
+
+    result = (
+        f"{icon} <b>Execution {label}</b>\n"
+        f"📄 File: <code>{esc(filename)}</code>\n"
+        f"⏱ Duration: <code>{duration:.2f}s</code>\n"
+        f"💳 Credits used: <code>{credits_used}</code>  →  Balance: <code>{new_balance}</code>"
+    )
+    if timed_out:
+        result += f"\n⚠️ Killed after <code>{EXECUTION_TIMEOUT}s</code>."
+    result += section(stdout_text, "📤 Output:")
+    result += section(stderr_text, "⚠️ Stderr:")
+    if not stdout_text and not stderr_text:
+        result += "\n<i>(No output produced)</i>"
+
+    if len(result) > 4000:
+        result = result[:4000] + "\n…<i>[truncated]</i>"
+
+    await status_msg.edit_text(result, parse_mode=ParseMode.HTML)
+    shutil.rmtree(sandbox_dir, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@admin_only
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📊 <b>Bot Statistics</b>\n"
+        "────────────────────────\n"
+        f"👥 <b>Total Users:</b> <code>{db.get_total_users()}</code>\n"
+        f"▶️ <b>Total Executions:</b> <code>{db.get_total_executions()}</code>\n"
+        f"💳 <b>Total Credits (all):</b> <code>{db.get_total_credits()}</code>\n"
+        f"🔄 <b>Active Sessions:</b> <code>{len(db.get_active_sessions())}</code>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_active_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sessions = db.get_active_sessions()
+    if not sessions:
+        await update.message.reply_text("✅ <b>No active sessions.</b>", parse_mode=ParseMode.HTML)
+        return
+    lines = ["🔄 <b>Active Sessions</b>\n"]
+    for s in sessions:
+        lines.append(
+            f"• UID <code>{s['user_id']}</code> | "
+            f"<code>{esc(s['filename'])}</code> | "
+            f"PID <code>{s['pid']}</code> | "
+            f"Since <code>{s['started_at']}</code>"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/gen_code &lt;credits&gt; &lt;max_uses&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        amount, max_uses = int(context.args[0]), int(context.args[1])
+        assert amount > 0 and max_uses > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ Both values must be positive integers.", parse_mode=ParseMode.HTML)
+        return
+    code = db.create_redeem_code(amount, max_uses)
+    await update.message.reply_text(
+        f"✅ <b>Code Created</b>\n\n"
+        f"🎟️ Code: <code>{esc(code)}</code>\n"
+        f"💳 Credits: <code>{amount}</code>\n"
+        f"👥 Max Uses: <code>{max_uses}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
+async def cmd_del_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/del_code &lt;CODE&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    code = context.args[0].upper().strip()
+    if db.delete_redeem_code(code):
+        await update.message.reply_text(f"✅ Code <code>{esc(code)}</code> deleted.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Code <code>{esc(code)}</code> not found.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/add_credits &lt;user_id&gt; &lt;amount&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        target_id, amount = int(context.args[0]), int(context.args[1])
+        assert amount > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ Provide valid user_id and positive amount.", parse_mode=ParseMode.HTML)
+        return
+    if not db.get_user(target_id):
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found.", parse_mode=ParseMode.HTML)
+        return
+    new_bal = db.add_credits(target_id, amount)
+    await update.message.reply_text(
+        f"✅ Added <b>{amount}</b> credits to <code>{target_id}</code>.\n"
+        f"💳 New balance: <code>{new_bal}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/block &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.", parse_mode=ParseMode.HTML)
+        return
+    if target_id == ADMIN_ID:
+        await update.message.reply_text("❌ Cannot block the admin.", parse_mode=ParseMode.HTML)
+        return
+    if db.block_user(target_id):
+        await update.message.reply_text(f"🚫 User <code>{target_id}</code> <b>blocked</b>.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/unblock &lt;user_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        target_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.", parse_mode=ParseMode.HTML)
+        return
+    if db.unblock_user(target_id):
+        await update.message.reply_text(f"✅ User <code>{target_id}</code> <b>unblocked</b>.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_list_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    blocked = db.get_blocked_users()
+    if not blocked:
+        await update.message.reply_text("✅ <b>No blocked users.</b>", parse_mode=ParseMode.HTML)
+        return
+    lines = ["🚫 <b>Blocked Users</b>\n"]
+    for u in blocked:
+        un = f"@{esc(u['username'])}" if u["username"] else "N/A"
+        lines.append(f"• <code>{u['user_id']}</code> | {esc(u['full_name'])} | {un}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = db.get_all_users()
+    if not users:
+        await update.message.reply_text("❌ No users found.", parse_mode=ParseMode.HTML)
+        return
+    chunks = [users[i:i + 30] for i in range(0, len(users), 30)]
+    for idx, chunk in enumerate(chunks):
+        lines = [f"👥 <b>Users</b> (page {idx+1}/{len(chunks)})\n"]
+        for u in chunk:
+            status = "🚫" if u["is_blocked"] else "✅"
+            un = f"@{esc(u['username'])}" if u["username"] else "N/A"
+            lines.append(f"{status} <code>{u['user_id']}</code> | {esc(u['full_name'])} | {un} | 💳{u['credits']}")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    broadcast_text = " ".join(context.args) if context.args else ""
+    is_photo_reply = (
+        msg.reply_to_message is not None
+        and msg.reply_to_message.photo
+    )
+
+    inline_url: Optional[str] = None
+    tokens = broadcast_text.split()
+    if tokens and tokens[-1].startswith("http"):
+        inline_url = tokens[-1]
+        broadcast_text = " ".join(tokens[:-1])
+
+    markup = None
+    if inline_url:
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Link", url=inline_url)]])
+
+    user_ids = db.get_unblocked_user_ids()
+    sent = failed = 0
+    bot: Bot = context.bot
+
+    await msg.reply_text(
+        f"📡 Broadcasting to <code>{len(user_ids)}</code> user(s)...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    for uid in user_ids:
+        try:
+            if is_photo_reply:
+                photo_id = msg.reply_to_message.photo[-1].file_id
+                caption = esc(broadcast_text) if broadcast_text else None
+                await bot.send_photo(
+                    chat_id=uid,
+                    photo=photo_id,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+            elif broadcast_text.strip():
+                await bot.send_message(
+                    chat_id=uid,
+                    text=esc(broadcast_text),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                )
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await msg.reply_text(
+        f"✅ <b>Broadcast Done</b>\n📨 Sent: <code>{sent}</code>\n❌ Failed: <code>{failed}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fallback handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+@registered
+async def handle_unknown_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "⚠️ Only <code>.py</code> files are accepted.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@registered
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💬 Send a <code>.py</code> file to execute it, or use /help.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    db.init_db()
+    logger.info("Database initialised.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # User commands
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("profile", cmd_profile))
+    app.add_handler(CommandHandler("credits", cmd_credits))
+    app.add_handler(CommandHandler("redeem",  cmd_redeem))
+    app.add_handler(CommandHandler("help",    cmd_help))
+
+    # Admin commands
+    app.add_handler(CommandHandler("stats",           cmd_stats))
+    app.add_handler(CommandHandler("active_sessions", cmd_active_sessions))
+    app.add_handler(CommandHandler("gen_code",        cmd_gen_code))
+    app.add_handler(CommandHandler("del_code",        cmd_del_code))
+    app.add_handler(CommandHandler("add_credits",     cmd_add_credits))
+    app.add_handler(CommandHandler("block",           cmd_block))
+    app.add_handler(CommandHandler("unblock",         cmd_unblock))
+    app.add_handler(CommandHandler("list_blocked",    cmd_list_blocked))
+    app.add_handler(CommandHandler("list_users",      cmd_list_users))
+    app.add_handler(CommandHandler("broadcast",       cmd_broadcast))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # File handlers
+    app.add_handler(MessageHandler(
+        filters.Document.MimeType("text/x-python") | filters.Document.FileExtension("py"),
+        handle_python_file,
+    ))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_unknown_file))
+
+    # Text fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("Bot polling started.")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
